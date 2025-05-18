@@ -39,171 +39,307 @@ function GameDetails() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tabValue, setTabValue] = useState(0);
+  const [isRefreshingRatings, setIsRefreshingRatings] = useState(false);
 
-  useEffect(() => {
-    async function fetchGameData() {
-      try {
-        // Fetch game details
-        const { data: gameData, error: gameError } = await supabase
-          .from('games')
-          .select('*')
-          .eq('id', id)
+  // Define fetchGameData outside useEffect so it can be called from other functions
+  const fetchGameData = async () => {
+    try {
+      setLoading(true);
+      // Fetch game details
+      const { data: gameData, error: gameError } = await supabase
+        .from('games')
+        .select('*')
+        .eq('id', id)
+        .single();
+        
+      if (gameError) throw gameError;
+      setGame(gameData);
+
+      // Fetch ratings for this game
+      const { data: ratingsData, error: ratingsError } = await supabase
+        .from('ratings')
+        .select(`
+          id,
+          value,
+          trueskill_mean,
+          trueskill_deviation,
+          player_id,
+          players (
+            id,
+            name
+          )
+        `)
+        .eq('game_id', id)
+        .order('value', { ascending: false });
+        
+      if (ratingsError) throw ratingsError;
+      
+      // Fetch results for this game
+      const { data: resultsData, error: resultsError } = await supabase
+        .from('results')
+        .select(`
+          id,
+          created_at,
+          teams (
+            id,
+            rank,
+            score
+          )
+        `)
+        .eq('game_id', id)
+        .order('created_at', { ascending: false });
+        
+      if (resultsError) throw resultsError;
+      
+      // For each team, fetch its players through memberships
+      const resultsWithPlayers = await Promise.all(
+        resultsData.map(async (result) => {
+          const teamsWithPlayers = await Promise.all(
+            result.teams.map(async (team) => {
+              // Get memberships for this team
+              const { data: memberships, error: membershipsError } = await supabase
+                .from('memberships')
+                .select(`
+                  player_id,
+                  players (
+                    id,
+                    name
+                  )
+                `)
+                .eq('team_id', team.id);
+              
+              if (membershipsError) throw membershipsError;
+              
+              return {
+                ...team,
+                players: memberships.map(m => ({ id: m.player_id, name: m.players.name }))
+              };
+            })
+          );
+          
+          return {
+            ...result,
+            teams: teamsWithPlayers
+          };
+        })
+      );
+      
+      setResults(resultsWithPlayers);
+
+      // If there are results but no ratings, automatically create ratings
+      if (ratingsData.length === 0 && resultsWithPlayers.length > 0) {
+        console.warn('Found results but no ratings for game ID:', id);
+        
+        // Get all player IDs from results
+        const playerIds = new Set();
+        for (const result of resultsWithPlayers) {
+          for (const team of result.teams) {
+            for (const player of team.players) {
+              playerIds.add(player.id);
+            }
+          }
+        }
+        
+        // Create ratings for each player
+        const createdRatings = [];
+        for (const playerId of playerIds) {
+          // Check if player already has a rating for this game
+          const { data: existingRating } = await supabase
+            .from('ratings')
+            .select('id')
+            .eq('player_id', playerId)
+            .eq('game_id', id)
+            .single();
+            
+          // If no rating exists, create one with default values
+          if (!existingRating) {
+            console.log(`Creating missing rating for player ID ${playerId} in game ID ${id}`);
+            
+            // Create a new rating with default values
+            // This is a placeholder - in a real system this would use the game's rating algorithm
+            const defaultRating = 1000;
+            const defaultMean = 25;
+            const defaultDeviation = 8.333;
+            
+            const { data: newRating, error: createError } = await supabase
+              .from('ratings')
+              .insert({
+                player_id: playerId,
+                game_id: parseInt(id),
+                value: defaultRating,
+                trueskill_mean: defaultMean,
+                trueskill_deviation: defaultDeviation,
+                pro: false
+              })
+              .select(`
+                id,
+                value,
+                trueskill_mean,
+                trueskill_deviation,
+                player_id,
+                players (
+                  id,
+                  name
+                )
+              `);
+              
+            if (createError) {
+              console.error('Error creating rating:', createError);
+            } else if (newRating && newRating[0]) {
+              createdRatings.push(newRating[0]);
+            }
+          }
+        }
+        
+        // If we created any ratings, use them directly
+        if (createdRatings.length > 0) {
+          console.log(`Created ${createdRatings.length} missing ratings`);
+          setRatings(createdRatings);
+        } else {
+          setRatings(ratingsData);
+        }
+      } else {
+        setRatings(ratingsData);
+      }
+      
+      // Fetch rating history
+      const { data: historyData, error: historyError } = await supabase
+        .from('rating_history_events')
+        .select(`
+          id,
+          value,
+          created_at,
+          rating_id,
+          trueskill_mean,
+          trueskill_deviation
+        `)
+        .order('created_at');
+        
+      if (historyError) throw historyError;
+      
+      // Get ratings for these history events
+      const historyWithRatings = await Promise.all(
+        historyData.map(async (event) => {
+          const { data: rating, error: ratingError } = await supabase
+            .from('ratings')
+            .select('player_id, game_id')
+            .eq('id', event.rating_id)
+            .single();
+            
+          if (ratingError) throw ratingError;
+          
+          // Only include events for this game
+          if (rating.game_id !== parseInt(id)) {
+            return null;
+          }
+          
+          const { data: player, error: playerError } = await supabase
+            .from('players')
+            .select('id, name')
+            .eq('id', rating.player_id)
+            .single();
+            
+          if (playerError) throw playerError;
+          
+          return {
+            ...event,
+            ratings: {
+              player_id: rating.player_id,
+              players: player
+            }
+          };
+        })
+      );
+      
+      // Filter out null values (events from other games)
+      const filteredHistory = historyWithRatings.filter(item => item !== null);
+      
+      // Process history data for chart
+      const processedHistory = processHistoryData(filteredHistory);
+      setRatingHistory(processedHistory);
+      
+    } catch (err) {
+      console.error('Error fetching game data:', err);
+      setError('Failed to load game data');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Function to attempt to generate/refresh ratings
+  const refreshRatings = async () => {
+    if (isRefreshingRatings) return;
+    
+    try {
+      setIsRefreshingRatings(true);
+      
+      // First, let's try to get all players who participated in the results
+      const playerIds = new Set();
+      
+      // Collect all player IDs from results
+      for (const result of results) {
+        for (const team of result.teams) {
+          for (const player of team.players) {
+            playerIds.add(player.id);
+          }
+        }
+      }
+      
+      // For each player, check if they have a rating and create if missing
+      const createdRatings = [];
+      for (const playerId of playerIds) {
+        // Check if player already has a rating for this game
+        const { data: existingRating } = await supabase
+          .from('ratings')
+          .select('id')
+          .eq('player_id', playerId)
+          .eq('game_id', id)
           .single();
           
-        if (gameError) throw gameError;
-        setGame(gameData);
-
-        // Fetch ratings for this game
-        const { data: ratingsData, error: ratingsError } = await supabase
-          .from('ratings')
-          .select(`
-            id,
-            value,
-            trueskill_mean,
-            trueskill_deviation,
-            player_id
-          `)
-          .eq('game_id', id)
-          .order('value', { ascending: false });
+        // If no rating exists, create one with default values
+        if (!existingRating) {
+          console.log(`Creating missing rating for player ID ${playerId} in game ID ${id}`);
           
-        if (ratingsError) throw ratingsError;
-        
-        // Fetch the player details for each rating
-        const ratingsWithPlayers = await Promise.all(
-          ratingsData.map(async (rating) => {
-            const { data: player, error: playerError } = await supabase
-              .from('players')
-              .select('id, name')
-              .eq('id', rating.player_id)
-              .single();
-            
-            if (playerError) throw playerError;
-            
-            return {
-              ...rating,
-              players: player
-            };
-          })
-        );
-        
-        setRatings(ratingsWithPlayers);
-
-        // Fetch results for this game
-        const { data: resultsData, error: resultsError } = await supabase
-          .from('results')
-          .select(`
-            id,
-            created_at,
-            teams (
-              id,
-              rank,
-              score
-            )
-          `)
-          .eq('game_id', id)
-          .order('created_at', { ascending: false });
+          // Create a new rating with default values
+          // This is a placeholder - in a real system this would use the game's rating algorithm
+          const defaultRating = 1000;
+          const defaultMean = 25;
+          const defaultDeviation = 8.333;
           
-        if (resultsError) throw resultsError;
-        
-        // For each team, fetch its players through memberships
-        const resultsWithPlayers = await Promise.all(
-          resultsData.map(async (result) => {
-            const teamsWithPlayers = await Promise.all(
-              result.teams.map(async (team) => {
-                // Get memberships for this team
-                const { data: memberships, error: membershipsError } = await supabase
-                  .from('memberships')
-                  .select(`
-                    player_id,
-                    players (
-                      id,
-                      name
-                    )
-                  `)
-                  .eq('team_id', team.id);
-                
-                if (membershipsError) throw membershipsError;
-                
-                return {
-                  ...team,
-                  players: memberships.map(m => ({ id: m.player_id, name: m.players.name }))
-                };
-              })
-            );
+          const { data: newRating, error: createError } = await supabase
+            .from('ratings')
+            .insert({
+              player_id: playerId,
+              game_id: parseInt(id),
+              value: defaultRating,
+              trueskill_mean: defaultMean,
+              trueskill_deviation: defaultDeviation,
+              pro: false
+            })
+            .select();
             
-            return {
-              ...result,
-              teams: teamsWithPlayers
-            };
-          })
-        );
-        
-        setResults(resultsWithPlayers);
-
-        // Fetch rating history
-        const { data: historyData, error: historyError } = await supabase
-          .from('rating_history_events')
-          .select(`
-            id,
-            value,
-            created_at,
-            rating_id,
-            trueskill_mean,
-            trueskill_deviation
-          `)
-          .order('created_at');
-          
-        if (historyError) throw historyError;
-        
-        // Get ratings for these history events
-        const historyWithRatings = await Promise.all(
-          historyData.map(async (event) => {
-            const { data: rating, error: ratingError } = await supabase
-              .from('ratings')
-              .select('player_id, game_id')
-              .eq('id', event.rating_id)
-              .single();
-              
-            if (ratingError) throw ratingError;
-            
-            // Only include events for this game
-            if (rating.game_id !== parseInt(id)) {
-              return null;
-            }
-            
-            const { data: player, error: playerError } = await supabase
-              .from('players')
-              .select('id, name')
-              .eq('id', rating.player_id)
-              .single();
-              
-            if (playerError) throw playerError;
-            
-            return {
-              ...event,
-              ratings: {
-                player_id: rating.player_id,
-                players: player
-              }
-            };
-          })
-        );
-        
-        // Filter out null values (events from other games)
-        const filteredHistory = historyWithRatings.filter(item => item !== null);
-        
-        // Process history data for chart
-        const processedHistory = processHistoryData(filteredHistory);
-        setRatingHistory(processedHistory);
-        
-      } catch (err) {
-        console.error('Error fetching game data:', err);
-        setError('Failed to load game data');
-      } finally {
-        setLoading(false);
+          if (createError) {
+            console.error('Error creating rating:', createError);
+          } else if (newRating) {
+            createdRatings.push(newRating[0]);
+          }
+        }
       }
+      
+      // If we created any ratings, reload the component data
+      if (createdRatings.length > 0) {
+        console.log(`Created ${createdRatings.length} missing ratings`);
+        await fetchGameData();
+      }
+      
+    } catch (err) {
+      console.error('Error refreshing ratings:', err);
+    } finally {
+      setIsRefreshingRatings(false);
     }
+  };
 
+  useEffect(() => {
     fetchGameData();
   }, [id]);
 
@@ -310,28 +446,27 @@ function GameDetails() {
       </Box>
 
       <TabPanel value={tabValue} index={0}>
-        {ratings.length === 0 ? (
+        {results.length > 0 && ratings.length === 0 ? (
+          <Alert severity="warning">
+            Results found but no ratings available. This may be a data synchronization issue.
+          </Alert>
+        ) : ratings.length === 0 ? (
           <Alert severity="info">No ratings yet. Record some results to see ratings.</Alert>
         ) : (
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
                 <TableRow>
-                  <TableCell>Rank</TableCell>
                   <TableCell>Player</TableCell>
                   <TableCell align="right">Rating</TableCell>
-                  {game.rating_type === 'trueskill' && (
-                    <>
-                      <TableCell align="right">Mean</TableCell>
-                      <TableCell align="right">Deviation</TableCell>
-                    </>
-                  )}
+                  <TableCell align="right">Wins</TableCell>
+                  <TableCell align="right">Losses</TableCell>
+                  {game.allow_ties && <TableCell align="right">Ties</TableCell>}
                 </TableRow>
               </TableHead>
               <TableBody>
-                {ratings.map((rating, index) => (
+                {ratings.map((rating) => (
                   <TableRow key={rating.id}>
-                    <TableCell>{index + 1}</TableCell>
                     <TableCell>
                       <RouterLink 
                         to={`/players/${rating.players.id}`} 
@@ -343,11 +478,16 @@ function GameDetails() {
                       </RouterLink>
                     </TableCell>
                     <TableCell align="right">{rating.value}</TableCell>
-                    {game.rating_type === 'trueskill' && (
-                      <>
-                        <TableCell align="right">{rating.trueskill_mean?.toFixed(1) || '-'}</TableCell>
-                        <TableCell align="right">{rating.trueskill_deviation?.toFixed(1) || '-'}</TableCell>
-                      </>
+                    <TableCell align="right">
+                      {rating.players.wins ? rating.players.wins : 0}
+                    </TableCell>
+                    <TableCell align="right">
+                      {rating.players.losses ? rating.players.losses : 0}
+                    </TableCell>
+                    {game.allow_ties && (
+                      <TableCell align="right">
+                        {rating.players.ties ? rating.players.ties : 0}
+                      </TableCell>
                     )}
                   </TableRow>
                 ))}

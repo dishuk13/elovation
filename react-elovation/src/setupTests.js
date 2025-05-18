@@ -7,7 +7,12 @@ jest.mock('./lib/supabase', () => ({
     from: jest.fn(() => ({
       select: jest.fn(() => ({
         order: jest.fn(() => Promise.resolve({ data: [], error: null })),
-        eq: jest.fn(() => Promise.resolve({ data: null, error: null }))
+        eq: jest.fn(() => ({
+          single: jest.fn(() => Promise.resolve({ data: null, error: null })),
+          order: jest.fn(() => Promise.resolve({ data: [], error: null })),
+          limit: jest.fn(() => Promise.resolve({ data: [], error: null }))
+        })),
+        limit: jest.fn(() => Promise.resolve({ data: [], error: null }))
       })),
       insert: jest.fn(() => Promise.resolve({ data: null, error: null })),
       update: jest.fn(() => Promise.resolve({ data: null, error: null })),

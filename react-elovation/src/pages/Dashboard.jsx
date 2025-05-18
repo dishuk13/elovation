@@ -27,8 +27,7 @@ function Dashboard() {
         const { data: gamesData, error: gamesError } = await supabase
           .from('games')
           .select('*')
-          .order('updated_at', { ascending: false })
-          .limit(5);
+          .order('updated_at', { ascending: false });
 
         if (gamesError) throw gamesError;
         setGames(gamesData);
@@ -42,8 +41,7 @@ function Dashboard() {
             game_id,
             games(name)
           `)
-          .order('created_at', { ascending: false })
-          .limit(10);
+          .order('created_at', { ascending: false });
 
         if (resultsError) throw resultsError;
         
