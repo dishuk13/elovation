@@ -32,3 +32,18 @@
 
 fly.toml
 coverage
+
+# React application
+/react-elovation/node_modules
+/react-elovation/.pnp
+/react-elovation/.pnp.js
+/react-elovation/dist
+/react-elovation/build
+/react-elovation/.env
+/react-elovation/.env.local
+/react-elovation/.env.development.local
+/react-elovation/.env.test.local
+/react-elovation/.env.production.local
+/react-elovation/npm-debug.log*
+/react-elovation/yarn-debug.log*
+/react-elovation/yarn-error.log*
