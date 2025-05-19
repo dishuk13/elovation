@@ -133,7 +133,42 @@ JOIN memberships ON teams.id = memberships.team_id
 JOIN players ON memberships.player_id = players.id;
 ```
 
+## Setting up Supabase Authentication with Google SSO
 
+This application uses Supabase for authentication with Google SSO. Follow these steps to set it up:
+
+1. Create a Supabase project at https://supabase.com if you haven't already.
+
+2. In your Supabase project dashboard, go to "Authentication" → "Providers" and enable Google authentication.
+
+3. Set up OAuth credentials in Google Cloud Platform:
+   - Go to https://console.cloud.google.com/
+   - Create a new project or use an existing one
+   - Navigate to "APIs & Services" → "Credentials"
+   - Click "Create Credentials" → "OAuth client ID"
+   - Set the application type to "Web application"
+   - Add authorized redirect URIs:
+     - `https://your-supabase-project.supabase.co/auth/v1/callback`
+     - `http://localhost:5173/auth/callback` (for local development)
+   - Save and note the Client ID and Client Secret
+
+4. Back in Supabase, configure Google Auth provider:
+   - Paste the Client ID and Client Secret from Google Cloud Console
+   - Save the configuration
+
+5. Create a `.env.local` file in the root of the react-elovation directory with the following variables:
+   ```
+   VITE_SUPABASE_URL=your_supabase_url_here
+   VITE_SUPABASE_ANON_KEY=your_supabase_anon_key_here
+   ```
+   Replace the placeholder values with your actual Supabase URL and anon key from your Supabase project settings → API section.
+
+6. Start the development server:
+   ```
+   npm run dev
+   ```
+
+7. The application should now have Google authentication enabled!
 
 ## Testing
 
