@@ -191,10 +191,10 @@ function Dashboard() {
                 <List>
                   {recentResults.map((result) => {
                     const winners = result.teams
-                      .filter(team => team.rank === 0)
+                      .filter(team => team.rank === 1)
                       .flatMap(team => team.players);
                     const losers = result.teams
-                      .filter(team => team.rank > 0)
+                      .filter(team => team.rank > 1)
                       .flatMap(team => team.players);
                     
                     return (
