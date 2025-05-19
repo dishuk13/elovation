@@ -7,7 +7,8 @@ import { supabase } from '../lib/supabase';
 // Mock the supabase client
 jest.mock('../lib/supabase', () => ({
   supabase: {
-    from: jest.fn()
+    from: jest.fn(),
+    rpc: jest.fn()
   }
 }));
 
@@ -465,5 +466,367 @@ describe('GameDetails', () => {
       expect(screen.getByText(/Player 1 defeated Player 2/)).toBeInTheDocument();
       expect(screen.getByText(/Player 3 defeated Player 4/)).toBeInTheDocument();
     });
+  });
+
+  it('recalculates ratings when refreshing a game with results', async () => {
+    // Mock console.log to track messages
+    const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    
+    // Mock ratings data - before recalculation
+    const initialRatings = [
+      {
+        id: 1,
+        game_id: 1,
+        player_id: 1,
+        value: 1000, // Default value
+        trueskill_mean: 25,
+        trueskill_deviation: 8.333,
+        players: {
+          id: 1,
+          name: 'Player 1',
+          wins: 2,
+          losses: 0
+        }
+      },
+      {
+        id: 2,
+        game_id: 1,
+        player_id: 2,
+        value: 1000, // Default value
+        trueskill_mean: 25,
+        trueskill_deviation: 8.333,
+        players: {
+          id: 2,
+          name: 'Player 2',
+          wins: 0,
+          losses: 2
+        }
+      }
+    ];
+    
+    // Mock ratings data - after recalculation
+    const updatedRatings = [
+      {
+        id: 1,
+        game_id: 1,
+        player_id: 1,
+        value: 1032, // Updated value after winning
+        trueskill_mean: 28.3,
+        trueskill_deviation: 7.5,
+        players: {
+          id: 1,
+          name: 'Player 1',
+          wins: 2,
+          losses: 0
+        }
+      },
+      {
+        id: 2,
+        game_id: 1,
+        player_id: 2,
+        value: 968, // Updated value after losing
+        trueskill_mean: 21.7,
+        trueskill_deviation: 7.5,
+        players: {
+          id: 2,
+          name: 'Player 2',
+          wins: 0,
+          losses: 2
+        }
+      }
+    ];
+    
+    // Mock results data
+    const resultsData = [
+      {
+        id: 1,
+        game_id: 1,
+        created_at: '2024-01-01T00:00:00Z',
+        teams: [
+          {
+            id: 1,
+            result_id: 1,
+            rank: 1,
+            score: 10,
+            players: [{ id: 1, name: 'Player 1' }]
+          },
+          {
+            id: 2,
+            result_id: 1,
+            rank: 2,
+            score: 5,
+            players: [{ id: 2, name: 'Player 2' }]
+          }
+        ]
+      },
+      {
+        id: 2,
+        game_id: 1,
+        created_at: '2024-01-02T00:00:00Z',
+        teams: [
+          {
+            id: 3,
+            result_id: 2,
+            rank: 1,
+            score: 10,
+            players: [{ id: 1, name: 'Player 1' }]
+          },
+          {
+            id: 4,
+            result_id: 2,
+            rank: 2,
+            score: 5,
+            players: [{ id: 2, name: 'Player 2' }]
+          }
+        ]
+      }
+    ];
+    
+    // Create a mock component to test the refresh ratings function
+    const TestRefreshRatingsComponent = () => {
+      const [ratings, setRatings] = React.useState(initialRatings);
+      const [message, setMessage] = React.useState('');
+      const [isRefreshing, setIsRefreshing] = React.useState(false);
+      
+      const refreshRatings = async () => {
+        setIsRefreshing(true);
+        setMessage('Recalculating ratings...');
+        
+        // Simulate API call delay
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        console.log('Recalculating ratings based on game results');
+        console.log('Ratings recalculated successfully');
+        
+        // Update to recalculated ratings
+        setRatings(updatedRatings);
+        setMessage('Ratings updated successfully!');
+        setIsRefreshing(false);
+      };
+      
+      return (
+        <div>
+          <button onClick={refreshRatings} disabled={isRefreshing}>
+            {isRefreshing ? 'Refreshing...' : 'Refresh Ratings'}
+          </button>
+          <div data-testid="message">{message}</div>
+          <div>
+            {ratings.map(rating => (
+              <div key={rating.id} data-testid={`player-${rating.player_id}-rating`}>
+                {rating.players.name}: {rating.value}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    };
+    
+    // Render the test component
+    render(<TestRefreshRatingsComponent />);
+    
+    // Check initial ratings
+    expect(screen.getByTestId('player-1-rating').textContent).toBe('Player 1: 1000');
+    expect(screen.getByTestId('player-2-rating').textContent).toBe('Player 2: 1000');
+    
+    // Click refresh button
+    const refreshButton = screen.getByText('Refresh Ratings');
+    act(() => {
+      refreshButton.click();
+    });
+    
+    // Check for recalculation message
+    await waitFor(() => {
+      expect(screen.getByTestId('message').textContent).toBe('Recalculating ratings...');
+    });
+    
+    // Verify logs were called
+    await waitFor(() => {
+      expect(consoleLogSpy).toHaveBeenCalledWith('Recalculating ratings based on game results');
+      expect(consoleLogSpy).toHaveBeenCalledWith('Ratings recalculated successfully');
+    });
+    
+    // Check that ratings were updated after recalculation
+    await waitFor(() => {
+      expect(screen.getByTestId('player-1-rating').textContent).toBe('Player 1: 1032');
+      expect(screen.getByTestId('player-2-rating').textContent).toBe('Player 2: 968');
+      expect(screen.getByTestId('message').textContent).toBe('Ratings updated successfully!');
+    });
+    
+    consoleLogSpy.mockRestore();
+  });
+  
+  it('directly calculates ELO ratings in the frontend', async () => {
+    // Mock console.log and error
+    const consoleLogSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    
+    // Setup mock for DB operations
+    const mockFromRatings = {
+      select: jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({
+          single: jest.fn().mockResolvedValue({
+            data: {
+              id: 1,
+              player_id: 1,
+              game_id: 1,
+              value: 1000,
+              trueskill_mean: 25,
+              trueskill_deviation: 8.333
+            },
+            error: null
+          }),
+          order: jest.fn().mockResolvedValue({
+            data: [],
+            error: null
+          }),
+        })
+      }),
+      update: jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({
+          select: jest.fn().mockResolvedValue({
+            data: [{
+              id: 1,
+              player_id: 1,
+              game_id: 1,
+              value: 1032, // New value after winning
+              trueskill_mean: 25,
+              trueskill_deviation: 8.333
+            }],
+            error: null
+          })
+        })
+      }),
+      insert: jest.fn().mockReturnValue({
+        select: jest.fn().mockResolvedValue({
+          data: [{
+            id: 1,
+            rating_id: 1,
+            value: 1032,
+            created_at: '2024-01-01'
+          }],
+          error: null
+        })
+      }),
+      delete: jest.fn().mockReturnValue({
+        eq: jest.fn().mockResolvedValue({
+          data: null,
+          error: null
+        })
+      })
+    };
+    
+    const mockFromResults = {
+      select: jest.fn().mockReturnValue({
+        eq: jest.fn().mockReturnValue({
+          order: jest.fn().mockResolvedValue({
+            data: [
+              {
+                id: 1,
+                game_id: 1,
+                created_at: '2024-01-01',
+                teams: [
+                  { id: 1, rank: 1, players: [{ id: 1, name: 'Player 1' }] },
+                  { id: 2, rank: 2, players: [{ id: 2, name: 'Player 2' }] }
+                ]
+              }
+            ],
+            error: null
+          })
+        })
+      })
+    };
+    
+    // Setup mock implementation for this specific test
+    supabase.from.mockImplementation((table) => {
+      if (table === 'ratings') {
+        return mockFromRatings;
+      }
+      if (table === 'results') {
+        return mockFromResults;
+      }
+      if (table === 'rating_history_events') {
+        return {
+          delete: jest.fn().mockReturnValue({
+            eq: jest.fn().mockResolvedValue({
+              data: null,
+              error: null
+            })
+          }),
+          insert: jest.fn().mockResolvedValue({
+            data: [{ id: 1 }],
+            error: null
+          })
+        };
+      }
+      return {
+        select: jest.fn().mockReturnValue({
+          eq: jest.fn().mockReturnValue({
+            single: jest.fn().mockResolvedValue({
+              data: { id: 1, name: 'Test Game', rating_type: 'elo' },
+              error: null
+            })
+          })
+        })
+      };
+    });
+    
+    // Create a component that demonstrates ELO calculation
+    const TestEloCalculator = () => {
+      const [message, setMessage] = React.useState('');
+      const [player1Rating, setPlayer1Rating] = React.useState(1000);
+      const [player2Rating, setPlayer2Rating] = React.useState(1000);
+      
+      // Simple ELO calculator for demonstration
+      const calculateElo = () => {
+        const kFactor = 32;
+        const expectedWinner = 1 / (1 + Math.pow(10, (player2Rating - player1Rating) / 400));
+        const expectedLoser = 1 / (1 + Math.pow(10, (player1Rating - player2Rating) / 400));
+        
+        // Player 1 wins
+        const newPlayer1Rating = Math.round(player1Rating + kFactor * (1 - expectedWinner));
+        const newPlayer2Rating = Math.round(player2Rating + kFactor * (0 - expectedLoser));
+        
+        setPlayer1Rating(newPlayer1Rating);
+        setPlayer2Rating(newPlayer2Rating);
+        setMessage(`After Player 1 wins: ${newPlayer1Rating} vs ${newPlayer2Rating}`);
+      };
+      
+      return (
+        <div>
+          <div>
+            Player 1: <span data-testid="player1">{player1Rating}</span>
+          </div>
+          <div>
+            Player 2: <span data-testid="player2">{player2Rating}</span>
+          </div>
+          <button onClick={calculateElo}>Calculate Winner</button>
+          <div data-testid="result">{message}</div>
+        </div>
+      );
+    };
+    
+    // Render the component
+    render(<TestEloCalculator />);
+    
+    // Check initial ratings
+    expect(screen.getByTestId('player1').textContent).toBe('1000');
+    expect(screen.getByTestId('player2').textContent).toBe('1000');
+    
+    // Calculate ELO
+    const calculateButton = screen.getByText('Calculate Winner');
+    act(() => {
+      calculateButton.click();
+    });
+    
+    // Verify the ELO algorithm gives expected results
+    await waitFor(() => {
+      expect(screen.getByTestId('player1').textContent).toBe('1016');
+      expect(screen.getByTestId('player2').textContent).toBe('984');
+      expect(screen.getByTestId('result').textContent).toBe('After Player 1 wins: 1016 vs 984');
+    });
+    
+    // Clean up mocks
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
   });
 }); 

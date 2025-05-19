@@ -137,7 +137,8 @@ function NewResult() {
       
       // Create player_teams connections
       const playerTeamsToInsert = [];
-      teams.forEach((team, teamIndex) => {
+      const validTeams = teams.filter(team => team.players.length > 0);
+      validTeams.forEach((team, teamIndex) => {
         team.players.forEach(player => {
           playerTeamsToInsert.push({
             player_id: player.id,
@@ -152,6 +153,9 @@ function NewResult() {
         
       if (playerTeamsError) throw playerTeamsError;
       
+      // Update player ratings based on this result
+      await updateRatings(resultData.id);
+      
       setSuccess(true);
       setTimeout(() => {
         navigate(`/games/${gameId}`);
@@ -161,6 +165,286 @@ function NewResult() {
       setError('Failed to record result. Please try again.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // Update player ratings based on the newly recorded result
+  const updateRatings = async (resultId) => {
+    try {
+      // Fetch the complete result with teams and players
+      const { data: result, error: resultError } = await supabase
+        .from('results')
+        .select(`
+          id,
+          created_at,
+          teams (
+            id,
+            rank,
+            score,
+            players:memberships (
+              player_id,
+              players (
+                id,
+                name
+              )
+            )
+          )
+        `)
+        .eq('id', resultId)
+        .single();
+      
+      if (resultError) throw resultError;
+      
+      // Format teams data
+      result.teams.forEach(team => {
+        team.players = team.players.map(p => ({
+          id: p.player_id,
+          name: p.players.name
+        }));
+      });
+      
+      // Fetch current player ratings
+      const playerIds = result.teams
+        .flatMap(team => team.players)
+        .map(player => player.id);
+      
+      const { data: ratings, error: ratingsError } = await supabase
+        .from('ratings')
+        .select('*')
+        .in('player_id', playerIds)
+        .eq('game_id', gameId);
+      
+      if (ratingsError) throw ratingsError;
+      
+      // Create a map of player ID to rating
+      const playerRatings = {};
+      ratings.forEach(rating => {
+        playerRatings[rating.player_id] = rating;
+      });
+      
+      // Create default ratings for players who don't have one yet
+      for (const playerId of playerIds) {
+        if (!playerRatings[playerId]) {
+          // Create a default rating for this player
+          const { data: newRating, error: createError } = await supabase
+            .from('ratings')
+            .insert({
+              player_id: playerId,
+              game_id: parseInt(gameId),
+              value: 1000, // Default rating
+              trueskill_mean: 25,
+              trueskill_deviation: 8.333,
+              pro: false
+            })
+            .select();
+            
+          if (createError) throw createError;
+          playerRatings[playerId] = newRating[0];
+        }
+      }
+      
+      // Calculate and update ratings based on the game type
+      if (game.rating_type === 'elo') {
+        // Process ELO rating update (1v1 games)
+        await updateEloRatings(result, playerRatings);
+      } else if (game.rating_type === 'trueskill') {
+        // Process TrueSkill rating update (team games)
+        await updateTrueSkillRatings(result, playerRatings);
+      }
+      
+    } catch (err) {
+      console.error('Error updating ratings:', err);
+      // Don't throw, just log error - we still want the result to be saved
+    }
+  };
+
+  // Update ELO ratings for 1v1 games
+  const updateEloRatings = async (result, playerRatings) => {
+    try {
+      const teams = result.teams.sort((a, b) => a.rank - b.rank);
+      
+      // Validate we have a proper 1v1 game
+      if (teams.length !== 2 || teams[0].players.length !== 1 || teams[1].players.length !== 1) {
+        console.warn('ELO rating is only supported for 1v1 games');
+        return;
+      }
+      
+      const winnerId = teams[0].players[0].id;
+      const loserId = teams[1].players[0].id;
+      const isTie = teams[0].rank === teams[1].rank;
+      
+      // Get current ratings
+      const winnerRating = playerRatings[winnerId];
+      const loserRating = playerRatings[loserId];
+      
+      if (!winnerRating || !loserRating) {
+        console.error('Missing player ratings');
+        return;
+      }
+      
+      // Calculate new ELO ratings
+      const kFactor = 32;
+      const expectedWinner = 1.0 / (1.0 + Math.pow(10, (loserRating.value - winnerRating.value) / 400.0));
+      const expectedLoser = 1.0 / (1.0 + Math.pow(10, (winnerRating.value - loserRating.value) / 400.0));
+      
+      let newWinnerRating, newLoserRating;
+      
+      if (isTie) {
+        // If it's a tie, both players get 0.5
+        newWinnerRating = Math.round(winnerRating.value + kFactor * (0.5 - expectedWinner));
+        newLoserRating = Math.round(loserRating.value + kFactor * (0.5 - expectedLoser));
+      } else {
+        // Otherwise winner gets 1.0, loser gets 0.0
+        newWinnerRating = Math.round(winnerRating.value + kFactor * (1.0 - expectedWinner));
+        newLoserRating = Math.round(loserRating.value + kFactor * (0.0 - expectedLoser));
+      }
+      
+      // Update winner's rating
+      await supabase
+        .from('ratings')
+        .update({ value: newWinnerRating })
+        .eq('id', winnerRating.id);
+      
+      // Create winner's history event
+      await supabase
+        .from('rating_history_events')
+        .insert({
+          rating_id: winnerRating.id,
+          value: newWinnerRating,
+          created_at: result.created_at
+        });
+      
+      // Update loser's rating
+      await supabase
+        .from('ratings')
+        .update({ value: newLoserRating })
+        .eq('id', loserRating.id);
+      
+      // Create loser's history event
+      await supabase
+        .from('rating_history_events')
+        .insert({
+          rating_id: loserRating.id,
+          value: newLoserRating,
+          created_at: result.created_at
+        });
+      
+    } catch (err) {
+      console.error('Error updating ELO ratings:', err);
+    }
+  };
+
+  // Update TrueSkill ratings for team games
+  const updateTrueSkillRatings = async (result, playerRatings) => {
+    try {
+      // Implementation similar to the one in GameDetails component
+      // This is a simplified version focused on updating the ratings
+      const teams = result.teams.sort((a, b) => a.rank - b.rank);
+      
+      // Group players by team to calculate team ratings
+      const teamRatings = [];
+      
+      for (const team of teams) {
+        const teamRank = team.rank;
+        const teamScore = team.score || 0;
+        const playerIds = team.players.map(p => p.id);
+        let teamMean = 0;
+        let teamVariance = 0;
+        
+        // Calculate team mean and variance
+        for (const playerId of playerIds) {
+          const playerRating = playerRatings[playerId];
+          if (!playerRating) continue;
+          
+          teamMean += playerRating.trueskill_mean || 25;
+          teamVariance += Math.pow(playerRating.trueskill_deviation || 8.333, 2);
+        }
+        
+        // Normalize
+        if (playerIds.length > 0) {
+          teamMean /= playerIds.length;
+          teamVariance /= Math.pow(playerIds.length, 2);
+        }
+        
+        teamRatings.push({
+          rank: teamRank,
+          score: teamScore,
+          mean: teamMean,
+          variance: teamVariance,
+          playerIds
+        });
+      }
+      
+      // Process teams in pairs
+      for (let i = 0; i < teamRatings.length - 1; i++) {
+        const team1 = teamRatings[i];
+        const team2 = teamRatings[i + 1];
+        
+        // Calculate skill difference
+        const skillDiff = team1.mean - team2.mean;
+        const beta = 4.166;
+        
+        // Calculate total variance
+        const totalVariance = team1.variance + team2.variance + 2 * Math.pow(beta, 2);
+        
+        // Determine if it's a tie
+        const isTie = team1.rank === team2.rank;
+        const margin = isTie ? 0 : 1;
+        
+        // Calculate win probability
+        const winProbability = 0.5 * (1 + Math.sign(skillDiff) * 
+          (1 - Math.exp(-Math.pow(skillDiff, 2) / (2 * totalVariance))));
+          
+        // Calculate factors for mean and deviation updates
+        const v = skillDiff / Math.sqrt(totalVariance);
+        const w = winProbability * (1 - winProbability);
+        
+        // Update players in both teams
+        for (const team of [team1, team2]) {
+          for (const playerId of team.playerIds) {
+            const playerRating = playerRatings[playerId];
+            if (!playerRating) continue;
+            
+            const playerMean = playerRating.trueskill_mean || 25;
+            const playerDeviation = playerRating.trueskill_deviation || 8.333;
+            
+            // Calculate mean delta based on team outcome
+            const sign = team === team1 ? 1 : -1;
+            const meanDelta = (Math.pow(playerDeviation, 2) / Math.sqrt(totalVariance)) * margin * sign;
+            
+            // Calculate new mean and deviation
+            const newPlayerMean = playerMean + meanDelta;
+            const newPlayerDeviation = playerDeviation * 
+              Math.sqrt(1 - (Math.pow(playerDeviation, 2) / totalVariance) * w);
+              
+            // Calculate conservative value (mean - 3*deviation)
+            const newPlayerValue = Math.floor((newPlayerMean - 3 * newPlayerDeviation) * 100);
+            
+            // Update the player's rating
+            await supabase
+              .from('ratings')
+              .update({
+                value: newPlayerValue,
+                trueskill_mean: newPlayerMean,
+                trueskill_deviation: newPlayerDeviation
+              })
+              .eq('id', playerRating.id);
+            
+            // Create rating history event
+            await supabase
+              .from('rating_history_events')
+              .insert({
+                rating_id: playerRating.id,
+                value: newPlayerValue,
+                trueskill_mean: newPlayerMean,
+                trueskill_deviation: newPlayerDeviation,
+                created_at: result.created_at
+              });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error updating TrueSkill ratings:', err);
     }
   };
 

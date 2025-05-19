@@ -273,7 +273,7 @@ function GameDetails() {
     try {
       setIsRefreshingRatings(true);
       
-      // First, let's try to get all players who participated in the results
+      // First, let's check if we need to create ratings for players
       const playerIds = new Set();
       
       // Collect all player IDs from results
@@ -286,12 +286,12 @@ function GameDetails() {
       }
       
       // For each player, check if they have a rating and create if missing
-      const createdRatings = [];
+      let playerRatings = {};
       for (const playerId of playerIds) {
         // Check if player already has a rating for this game
         const { data: existingRating } = await supabase
           .from('ratings')
-          .select('id')
+          .select('*')
           .eq('player_id', playerId)
           .eq('game_id', id)
           .single();
@@ -301,7 +301,6 @@ function GameDetails() {
           console.log(`Creating missing rating for player ID ${playerId} in game ID ${id}`);
           
           // Create a new rating with default values
-          // This is a placeholder - in a real system this would use the game's rating algorithm
           const defaultRating = 1000;
           const defaultMean = 25;
           const defaultDeviation = 8.333;
@@ -321,21 +320,277 @@ function GameDetails() {
           if (createError) {
             console.error('Error creating rating:', createError);
           } else if (newRating) {
-            createdRatings.push(newRating[0]);
+            playerRatings[playerId] = newRating[0];
           }
+        } else {
+          playerRatings[playerId] = existingRating;
         }
       }
       
-      // If we created any ratings, reload the component data
-      if (createdRatings.length > 0) {
-        console.log(`Created ${createdRatings.length} missing ratings`);
-        await fetchGameData();
+      // Now we need to recalculate ratings based on all the game results
+      if (results.length > 0 && Object.keys(playerRatings).length > 0) {
+        console.log('Recalculating ratings based on game results');
+        
+        // First, delete existing rating history events 
+        if (results.length > 0) {
+          for (const playerId in playerRatings) {
+            const ratingId = playerRatings[playerId].id;
+            
+            // Delete existing history events
+            const { error: deleteError } = await supabase
+              .from('rating_history_events')
+              .delete()
+              .eq('rating_id', ratingId);
+              
+            if (deleteError) {
+              console.error(`Error deleting history events for rating ${ratingId}:`, deleteError);
+            }
+          }
+        }
+        
+        // Sort results by creation date (ascending)
+        const sortedResults = [...results].sort(
+          (a, b) => new Date(a.created_at) - new Date(b.created_at)
+        );
+        
+        // Process each result in chronological order
+        for (const result of sortedResults) {
+          await processResult(result, playerRatings, game.rating_type);
+        }
+        
+        console.log('Ratings recalculated successfully');
       }
+      
+      // Reload the component data
+      await fetchGameData();
       
     } catch (err) {
       console.error('Error refreshing ratings:', err);
+      setError('An error occurred while refreshing ratings.');
     } finally {
       setIsRefreshingRatings(false);
+    }
+  };
+
+  // Process a single result and update ratings
+  const processResult = async (result, playerRatings, ratingType) => {
+    try {
+      const teams = result.teams.sort((a, b) => a.rank - b.rank);
+      
+      if (ratingType === 'elo') {
+        // ELO is only for 1v1 games
+        if (teams.length !== 2 || teams[0].players.length !== 1 || teams[1].players.length !== 1) {
+          console.warn('ELO rating is only supported for 1v1 games');
+          return;
+        }
+        
+        const winnerId = teams[0].players[0].id;
+        const loserId = teams[1].players[0].id;
+        const isTie = teams[0].rank === teams[1].rank;
+        
+        // Get player ratings
+        const winnerRating = playerRatings[winnerId];
+        const loserRating = playerRatings[loserId];
+        
+        if (!winnerRating || !loserRating) {
+          console.error('Missing player ratings');
+          return;
+        }
+        
+        // Calculate new ELO ratings
+        const { newWinnerRating, newLoserRating } = calculateEloRating(
+          winnerRating.value, 
+          loserRating.value, 
+          isTie
+        );
+        
+        // Update winner's rating
+        const { data: updatedWinner, error: winnerError } = await supabase
+          .from('ratings')
+          .update({ value: newWinnerRating })
+          .eq('id', winnerRating.id)
+          .select();
+          
+        if (winnerError) {
+          console.error('Error updating winner rating:', winnerError);
+        } else if (updatedWinner) {
+          playerRatings[winnerId] = updatedWinner[0];
+          
+          // Create history event
+          await supabase.from('rating_history_events').insert({
+            rating_id: winnerRating.id,
+            value: newWinnerRating,
+            created_at: result.created_at
+          });
+        }
+        
+        // Update loser's rating
+        const { data: updatedLoser, error: loserError } = await supabase
+          .from('ratings')
+          .update({ value: newLoserRating })
+          .eq('id', loserRating.id)
+          .select();
+          
+        if (loserError) {
+          console.error('Error updating loser rating:', loserError);
+        } else if (updatedLoser) {
+          playerRatings[loserId] = updatedLoser[0];
+          
+          // Create history event
+          await supabase.from('rating_history_events').insert({
+            rating_id: loserRating.id,
+            value: newLoserRating,
+            created_at: result.created_at
+          });
+        }
+      } else if (ratingType === 'trueskill') {
+        // For TrueSkill, we need to process team-based ratings
+        // This is a simplified TrueSkill implementation
+        await processTrueSkillRatings(teams, playerRatings, result.created_at);
+      }
+    } catch (err) {
+      console.error('Error processing result:', err);
+    }
+  };
+  
+  // Calculate new ELO ratings
+  const calculateEloRating = (winnerRating, loserRating, isTie) => {
+    const kFactor = 32;
+    
+    // Calculate expected scores
+    const expectedWinner = 1.0 / (1.0 + Math.pow(10, (loserRating - winnerRating) / 400.0));
+    const expectedLoser = 1.0 / (1.0 + Math.pow(10, (winnerRating - loserRating) / 400.0));
+    
+    let newWinnerRating, newLoserRating;
+    
+    if (isTie) {
+      // If it's a tie, both players get 0.5
+      newWinnerRating = Math.round(winnerRating + kFactor * (0.5 - expectedWinner));
+      newLoserRating = Math.round(loserRating + kFactor * (0.5 - expectedLoser));
+    } else {
+      // Otherwise winner gets 1.0, loser gets 0.0
+      newWinnerRating = Math.round(winnerRating + kFactor * (1.0 - expectedWinner));
+      newLoserRating = Math.round(loserRating + kFactor * (0.0 - expectedLoser));
+    }
+    
+    return { newWinnerRating, newLoserRating };
+  };
+  
+  // Process TrueSkill ratings update
+  const processTrueSkillRatings = async (teams, playerRatings, resultDate) => {
+    try {
+      // Group players by team to calculate team ratings
+      const teamRatings = [];
+      
+      for (const team of teams) {
+        const teamRank = team.rank;
+        const teamScore = team.score || 0;
+        const playerIds = team.players.map(p => p.id);
+        let teamMean = 0;
+        let teamVariance = 0;
+        
+        // Calculate team mean and variance
+        for (const playerId of playerIds) {
+          const playerRating = playerRatings[playerId];
+          if (!playerRating) continue;
+          
+          teamMean += playerRating.trueskill_mean || 25;
+          teamVariance += Math.pow(playerRating.trueskill_deviation || 8.333, 2);
+        }
+        
+        // Normalize
+        if (playerIds.length > 0) {
+          teamMean /= playerIds.length;
+          teamVariance /= Math.pow(playerIds.length, 2);
+        }
+        
+        teamRatings.push({
+          rank: teamRank,
+          score: teamScore,
+          mean: teamMean,
+          variance: teamVariance,
+          playerIds
+        });
+      }
+      
+      // Sort by rank
+      teamRatings.sort((a, b) => a.rank - b.rank);
+      
+      // Process teams in order
+      for (let i = 0; i < teamRatings.length - 1; i++) {
+        const team1 = teamRatings[i];
+        const team2 = teamRatings[i + 1];
+        
+        // Calculate skill difference
+        const skillDiff = team1.mean - team2.mean;
+        const beta = 4.166;
+        
+        // Calculate total variance (add dynamic factor for draws)
+        const totalVariance = team1.variance + team2.variance + 2 * Math.pow(beta, 2);
+        
+        // Determine if it's a tie
+        const isTie = team1.score === team2.score;
+        const margin = isTie ? 0 : Math.sign(team1.score - team2.score);
+        
+        // Calculate win probability
+        const winProbability = 0.5 * (1 + Math.sign(skillDiff) * 
+          (1 - Math.exp(-Math.pow(skillDiff, 2) / (2 * totalVariance))));
+          
+        // Calculate factors for mean and deviation updates
+        const v = skillDiff / Math.sqrt(totalVariance);
+        const w = winProbability * (1 - winProbability);
+        
+        // Update players in both teams
+        for (const team of [team1, team2]) {
+          for (const playerId of team.playerIds) {
+            const playerRating = playerRatings[playerId];
+            if (!playerRating) continue;
+            
+            const playerMean = playerRating.trueskill_mean || 25;
+            const playerDeviation = playerRating.trueskill_deviation || 8.333;
+            
+            // Calculate mean delta based on team outcome
+            const sign = team === team1 ? 1 : -1;
+            const meanDelta = (Math.pow(playerDeviation, 2) / Math.sqrt(totalVariance)) * margin * sign;
+            
+            // Calculate new mean and deviation
+            const newPlayerMean = playerMean + meanDelta;
+            const newPlayerDeviation = playerDeviation * 
+              Math.sqrt(1 - (Math.pow(playerDeviation, 2) / totalVariance) * w);
+              
+            // Calculate conservative value (mean - 3*deviation)
+            const newPlayerValue = Math.floor((newPlayerMean - 3 * newPlayerDeviation) * 100);
+            
+            // Update player rating
+            const { data: updatedPlayer, error: updateError } = await supabase
+              .from('ratings')
+              .update({
+                value: newPlayerValue,
+                trueskill_mean: newPlayerMean,
+                trueskill_deviation: newPlayerDeviation
+              })
+              .eq('id', playerRating.id)
+              .select();
+              
+            if (updateError) {
+              console.error(`Error updating rating for player ${playerId}:`, updateError);
+            } else if (updatedPlayer) {
+              playerRatings[playerId] = updatedPlayer[0];
+              
+              // Create history event
+              await supabase.from('rating_history_events').insert({
+                rating_id: playerRating.id,
+                value: newPlayerValue,
+                trueskill_mean: newPlayerMean,
+                trueskill_deviation: newPlayerDeviation,
+                created_at: resultDate
+              });
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error processing TrueSkill ratings:', err);
     }
   };
 
